@@ -1,0 +1,4 @@
+streamlit>=1.49,<2
+numpy>=1.26,<3
+matplotlib>=3.8,<4
+xgboost>=2.0,<4

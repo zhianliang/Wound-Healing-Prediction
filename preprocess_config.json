@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "model_positive_class": "yes",
+  "web_event": "poor wound healing",
+  "threshold_yes": 0.20854701586067675,
+  "threshold_poor": 0.79145298413932319,
+  "predictors": ["TCPO2", "Amputation_level", "Wound", "Infection", "PNI"],
+  "predictor_class": {
+    "TCPO2": "numeric",
+    "Amputation_level": "factor",
+    "Wound": "ordered",
+    "Infection": "ordered",
+    "PNI": "numeric"
+  },
+  "ui_metadata": {
+    "TCPO2": {
+      "name": "TCPO2",
+      "label": "TCPO2",
+      "type": "numeric",
+      "observed_min": 0,
+      "observed_max": 109,
+      "default": 24,
+      "step": 1
+    },
+    "Amputation_level": {
+      "name": "Amputation_level",
+      "label": "Amputation level",
+      "type": "categorical",
+      "levels": ["1", "2", "3", "4"],
+      "default": "1"
+    },
+    "Wound": {
+      "name": "Wound",
+      "label": "Wound",
+      "type": "categorical",
+      "levels": ["0", "1", "2", "3"],
+      "default": "0"
+    },
+    "Infection": {
+      "name": "Infection",
+      "label": "Infection",
+      "type": "categorical",
+      "levels": ["0", "1", "2", "3"],
+      "default": "0"
+    },
+    "PNI": {
+      "name": "PNI",
+      "label": "PNI",
+      "type": "numeric",
+      "observed_min": 20.75,
+      "observed_max": 56.537500000000001,
+      "default": 38.200000000000003,
+      "step": 0.10000000000000001
+    }
+  },
+  "cap_lower": {
+    "TCPO2": 0,
+    "PNI": 20.75
+  },
+  "cap_upper": {
+    "TCPO2": 109,
+    "PNI": 56.537500000000001
+  },
+  "scale_means": {
+    "TCPO2": 31.5,
+    "PNI": 37.898777173913047
+  },
+  "scale_sds": {
+    "TCPO2": 29.393938769134639,
+    "PNI": 7.2766291661720794
+  },
+  "model_features": ["TCPO2", "Amputation_level.4", "Wound.L", "Wound.Q", "Wound.C", "Infection.L", "Infection.Q", "Infection.C", "PNI"],
+  "baseline_vector": [0, 0, -0.67082039324993692, 0.5, -0.22360679774997891, -0.67082039324993692, 0.5, -0.22360679774997891, 0],
+  "numeric_deltas": {
+    "TCPO2": [1, 0, 0, 0, 0, 0, 0, 0, 0],
+    "PNI": [0, 0, 0, 0, 0, 0, 0, 0, 1]
+  },
+  "categorical_deltas": {
+    "Amputation_level": {
+      "1": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "2": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "3": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "4": [0, 1, 0, 0, 0, 0, 0, 0, 0]
+    },
+    "Wound": {
+      "0": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "1": [0, 0, 0.44721359549995798, -1, 0.89442719099991574, 0, 0, 0, 0],
+      "2": [0, 0, 0.89442719099991586, -1, -0.44721359549995798, 0, 0, 0, 0],
+      "3": [0, 0, 1.3416407864998738, 0, 0.44721359549995787, 0, 0, 0, 0]
+    },
+    "Infection": {
+      "0": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "1": [0, 0, 0, 0, 0, 0.44721359549995798, -1, 0.89442719099991574, 0],
+      "2": [0, 0, 0, 0, 0, 0.89442719099991586, -1, -0.44721359549995798, 0],
+      "3": [0, 0, 0, 0, 0, 1.3416407864998738, 0, 0.44721359549995787, 0]
+    }
+  },
+  "model_to_original": {
+    "TCPO2": "TCPO2",
+    "Amputation_level.4": "Amputation_level",
+    "Wound.L": "Wound",
+    "Wound.Q": "Wound",
+    "Wound.C": "Wound",
+    "Infection.L": "Infection",
+    "Infection.Q": "Infection",
+    "Infection.C": "Infection",
+    "PNI": "PNI"
+  },
+  "verification": {
+    "max_encoding_difference": 2.7755575615628914e-17,
+    "max_native_caret_probability_difference": 0,
+    "r_xgboost_version": "1.7.3.1"
+  }
+}
