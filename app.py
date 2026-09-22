@@ -1,70 +1,124 @@
 # ============================================================
 # app.py
+#
 # Final R-trained XGBoost -> pure Python Streamlit deployment
-# Target displayed: POOR WOUND HEALING
-# Stable static red/blue SHAP force plot (no JS/HTML rendering)
+#
+# Web target:
+#   Probability of POOR WOUND HEALING
+#
+# Display:
+#   - Prediction Result
+#   - Probability of poor wound healing
+#   - Classic SHAP force plot
+#
+# Required files in the same folder:
+#   app.py
+#   xgb_final_model.json
+#   preprocess_config.json
 # ============================================================
 
 from pathlib import Path
-import io
 import json
 import math
+import warnings
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
 import numpy as np
+import shap
 import streamlit as st
 import xgboost as xgb
+
+warnings.filterwarnings("ignore")
+
+
+# ============================================================
+# 1. Files
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "preprocess_config.json"
 MODEL_FILE = BASE_DIR / "xgb_final_model.json"
+
+
+# ============================================================
+# 2. Page
+# ============================================================
 
 st.set_page_config(
     page_title="Poor Wound Healing Prediction",
     page_icon="🏥",
     layout="wide",
 )
+
 st.title("🏥 Poor Wound Healing Prediction")
 st.caption(
-    "Enter a new patient's clinical characteristics to estimate the probability "
-    "of poor wound healing and obtain an individualized SHAP explanation."
+    "Enter a new patient's clinical characteristics to estimate "
+    "the probability of poor wound healing."
 )
+
+
+# ============================================================
+# 3. Load model and preprocessing configuration
+# ============================================================
 
 @st.cache_resource
 def load_assets():
-    if not CONFIG_FILE.exists():
-        raise FileNotFoundError("preprocess_config.json is missing.")
-    if not MODEL_FILE.exists():
-        raise FileNotFoundError("xgb_final_model.json is missing.")
 
-    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(
+            "preprocess_config.json is missing."
+        )
+
+    if not MODEL_FILE.exists():
+        raise FileNotFoundError(
+            "xgb_final_model.json is missing."
+        )
+
+    config = json.loads(
+        CONFIG_FILE.read_text(
+            encoding="utf-8"
+        )
+    )
+
     booster = xgb.Booster()
-    booster.load_model(str(MODEL_FILE))
+    booster.load_model(
+        str(MODEL_FILE)
+    )
+
     return config, booster
+
 
 try:
     CONFIG, BOOSTER = load_assets()
+
 except Exception as exc:
-    st.error(f"Deployment files could not be loaded: {exc}")
+    st.error(
+        f"Model files could not be loaded: {exc}"
+    )
     st.stop()
+
 
 PREDICTORS = CONFIG["predictors"]
 MODEL_FEATURES = CONFIG["model_features"]
-BASE_VECTOR = np.asarray(CONFIG["baseline_vector"], dtype=float)
 
-# Backward-compatible with the previous exporter.
-if "threshold_poor" in CONFIG:
-    THRESHOLD_POOR = float(CONFIG["threshold_poor"])
-else:
-    THRESHOLD_POOR = 1.0 - float(CONFIG["threshold"])
+BASE_VECTOR = np.asarray(
+    CONFIG["baseline_vector"],
+    dtype=float,
+)
 
-if BASE_VECTOR.shape[0] != len(MODEL_FEATURES):
-    st.error("preprocess_config.json has inconsistent model dimensions.")
+if len(BASE_VECTOR) != len(MODEL_FEATURES):
+    st.error(
+        "The preprocessing configuration has inconsistent dimensions."
+    )
     st.stop()
 
 
+# ============================================================
+# 4. Helpers
+# ============================================================
+
 def clean_label(name):
+
     return (
         str(name)
         .replace("_pct", " (%)")
@@ -74,329 +128,506 @@ def clean_label(name):
 
 
 def sigmoid(x):
+
     if x >= 0:
         z = math.exp(-x)
         return 1.0 / (1.0 + z)
+
     z = math.exp(x)
     return z / (1.0 + z)
 
 
+# ============================================================
+# 5. Exact preprocessing exported from R
+# ============================================================
+
 def preprocess_new_patient(raw_values):
-    """Reproduce the exact preprocessing exported from the R pipeline."""
+
     vec = BASE_VECTOR.copy()
 
     for variable in PREDICTORS:
-        kind = CONFIG["predictor_class"][variable]
+
+        kind = CONFIG[
+            "predictor_class"
+        ][variable]
 
         if kind == "numeric":
-            value = float(raw_values[variable])
 
-            if variable in CONFIG["cap_lower"]:
-                value = max(value, float(CONFIG["cap_lower"][variable]))
-            if variable in CONFIG["cap_upper"]:
-                value = min(value, float(CONFIG["cap_upper"][variable]))
+            value = float(
+                raw_values[variable]
+            )
 
-            if variable in CONFIG["scale_means"]:
-                mean = float(CONFIG["scale_means"][variable])
-                sd = float(CONFIG["scale_sds"][variable])
-                value = (value - mean) / sd
+            # Training-derived 1% / 99% capping
+            if variable in CONFIG.get(
+                "cap_lower",
+                {}
+            ):
+                value = max(
+                    value,
+                    float(
+                        CONFIG[
+                            "cap_lower"
+                        ][variable]
+                    )
+                )
 
-            delta = np.asarray(CONFIG["numeric_deltas"][variable], dtype=float)
+            if variable in CONFIG.get(
+                "cap_upper",
+                {}
+            ):
+                value = min(
+                    value,
+                    float(
+                        CONFIG[
+                            "cap_upper"
+                        ][variable]
+                    )
+                )
+
+            # Training-derived standardization
+            if variable in CONFIG.get(
+                "scale_means",
+                {}
+            ):
+                mean = float(
+                    CONFIG[
+                        "scale_means"
+                    ][variable]
+                )
+
+                sd = float(
+                    CONFIG[
+                        "scale_sds"
+                    ][variable]
+                )
+
+                value = (
+                    value - mean
+                ) / sd
+
+            delta = np.asarray(
+                CONFIG[
+                    "numeric_deltas"
+                ][variable],
+                dtype=float,
+            )
+
             vec += value * delta
 
         else:
-            level = str(raw_values[variable])
-            level_map = CONFIG["categorical_deltas"][variable]
-            if level not in level_map:
-                raise ValueError(f"Invalid category for {variable}: {level}")
-            vec += np.asarray(level_map[level], dtype=float)
 
-    if not np.all(np.isfinite(vec)):
-        raise ValueError("Preprocessing generated non-finite values.")
+            level = str(
+                raw_values[variable]
+            )
+
+            level_map = CONFIG[
+                "categorical_deltas"
+            ][variable]
+
+            if level not in level_map:
+                raise ValueError(
+                    f"Invalid category for {variable}: {level}"
+                )
+
+            vec += np.asarray(
+                level_map[level],
+                dtype=float,
+            )
+
+    if not np.all(
+        np.isfinite(vec)
+    ):
+        raise ValueError(
+            "Preprocessing generated a non-finite model value."
+        )
 
     return vec
 
 
+# ============================================================
+# 6. Prediction + exact TreeSHAP
+# ============================================================
+
 def predict_and_explain(raw_values):
-    x_vector = preprocess_new_patient(raw_values)
-    x_matrix = x_vector.reshape(1, -1)
 
-    dnew = xgb.DMatrix(x_matrix, feature_names=MODEL_FEATURES)
+    model_vector = preprocess_new_patient(
+        raw_values
+    )
 
-    # The final trained model predicts P(healing=yes).
-    probability_yes = float(BOOSTER.predict(dnew)[0])
-    probability_poor = 1.0 - probability_yes
+    matrix = model_vector.reshape(
+        1,
+        -1,
+    )
 
-    # Exact XGBoost TreeSHAP contributions for the original yes-margin.
+    dnew = xgb.DMatrix(
+        matrix,
+        feature_names=MODEL_FEATURES,
+    )
+
+    # Original model predicts P(Wound_Healing = yes)
+    probability_yes = float(
+        BOOSTER.predict(
+            dnew
+        )[0]
+    )
+
+    # Website target = poor wound healing
+    probability_poor = (
+        1.0 - probability_yes
+    )
+
+    # Exact XGBoost TreeSHAP for original yes class
     contribution = BOOSTER.predict(
         dnew,
         pred_contribs=True,
         approx_contribs=False,
     )[0]
 
-    shap_yes = np.asarray(contribution[:-1], dtype=float)
-    base_yes = float(contribution[-1])
+    shap_yes = np.asarray(
+        contribution[:-1],
+        dtype=float,
+    )
 
-    # For the complementary poor-healing event:
-    # margin_poor = -margin_yes, so SHAP and base value are negated.
+    base_yes = float(
+        contribution[-1]
+    )
+
+    # Convert explanation to poor wound healing.
+    #
+    # p_poor = 1 - sigmoid(margin_yes)
+    #        = sigmoid(-margin_yes)
+    #
+    # Hence:
+    # base_poor = -base_yes
+    # shap_poor = -shap_yes
+
     shap_poor = -shap_yes
     base_poor = -base_yes
 
+    # Group encoded columns back into original clinical variables
     grouped = {}
-    mapping = CONFIG["model_to_original"]
 
-    for model_feature, shap_value in zip(MODEL_FEATURES, shap_poor):
-        group = mapping.get(model_feature, model_feature)
-        grouped[group] = grouped.get(group, 0.0) + float(shap_value)
+    mapping = CONFIG[
+        "model_to_original"
+    ]
 
-    groups = [v for v in PREDICTORS if v in grouped]
-    groups.extend([v for v in grouped if v not in groups])
-    grouped_values = np.asarray([grouped[v] for v in groups], dtype=float)
+    for model_feature, shap_value in zip(
+        MODEL_FEATURES,
+        shap_poor,
+    ):
 
-    reconstructed_margin = base_poor + float(grouped_values.sum())
-    reconstructed_probability = sigmoid(reconstructed_margin)
+        original_feature = mapping.get(
+            model_feature,
+            model_feature,
+        )
 
-    if abs(reconstructed_probability - probability_poor) > 1e-5:
-        raise ValueError("SHAP additivity check failed for poor wound healing.")
+        grouped[
+            original_feature
+        ] = (
+            grouped.get(
+                original_feature,
+                0.0,
+            )
+            + float(shap_value)
+        )
+
+    groups = [
+        variable
+        for variable in PREDICTORS
+        if variable in grouped
+    ]
+
+    extras = [
+        variable
+        for variable in grouped
+        if variable not in groups
+    ]
+
+    groups.extend(extras)
+
+    grouped_shap = np.asarray(
+        [
+            grouped[variable]
+            for variable in groups
+        ],
+        dtype=float,
+    )
+
+    # Additivity check
+    margin_poor = (
+        base_poor
+        + float(
+            grouped_shap.sum()
+        )
+    )
+
+    reconstructed_probability = sigmoid(
+        margin_poor
+    )
+
+    if abs(
+        reconstructed_probability
+        - probability_poor
+    ) > 1e-5:
+        raise ValueError(
+            "SHAP additivity check failed."
+        )
 
     return {
         "probability_poor": probability_poor,
-        "probability_yes": probability_yes,
         "base_poor": base_poor,
         "groups": groups,
-        "grouped_shap": grouped_values,
+        "grouped_shap": grouped_shap,
     }
 
 
-def make_force_plot(result, raw_values):
-    """
-    Stable static SHAP force plot.
-    Red  = increases poor wound-healing risk.
-    Blue = decreases poor wound-healing risk.
-    No JavaScript/HTML is used, so Streamlit Cloud rendering is stable.
-    """
-    names = result["groups"]
-    values = np.asarray(result["grouped_shap"], dtype=float)
+# ============================================================
+# 7. Classic SHAP force plot
+# ============================================================
 
-    order = np.argsort(np.abs(values))[::-1]
-    n_show = min(8, len(order))
-    keep = order[:n_show]
-    rest = order[n_show:]
+def make_classic_force_plot(
+    result,
+    raw_values,
+):
 
-    shown_names = [clean_label(names[i]) for i in keep]
-    shown_values = [float(values[i]) for i in keep]
-    shown_raw = [str(raw_values.get(names[i], "")) for i in keep]
+    groups = result["groups"]
 
-    if len(rest) > 0:
-        other = float(values[rest].sum())
-        if abs(other) > 1e-12:
-            shown_names.append("Other features")
-            shown_values.append(other)
-            shown_raw.append("")
+    shap_values = np.asarray(
+        result["grouped_shap"],
+        dtype=float,
+    )
 
-    # Put largest forces first in the cumulative sequence.
-    local_order = np.argsort(np.abs(np.asarray(shown_values)))[::-1]
-    shown_names = [shown_names[i] for i in local_order]
-    shown_values = [shown_values[i] for i in local_order]
-    shown_raw = [shown_raw[i] for i in local_order]
+    feature_names = [
+        clean_label(
+            variable
+        )
+        for variable in groups
+    ]
 
-    base = float(result["base_poor"])
-    final_margin = base + sum(shown_values)
+    feature_values = np.asarray(
+        [
+            raw_values.get(
+                variable,
+                ""
+            )
+            for variable in groups
+        ],
+        dtype=object,
+    )
 
-    fig, ax = plt.subplots(figsize=(13.5, 4.6))
-    y = 0.52
-    current = base
-    positions = [base]
+    # Remove exact-zero contributions from display only.
+    keep = np.where(
+        np.abs(
+            shap_values
+        ) > 1e-12
+    )[0]
 
-    for feature, raw_value, shap_value in zip(
-        shown_names, shown_raw, shown_values
+    if len(keep) == 0:
+        keep = np.arange(
+            len(
+                shap_values
+            )
+        )
+
+    show_shap = shap_values[
+        keep
+    ]
+
+    show_values = feature_values[
+        keep
+    ]
+
+    show_names = [
+        feature_names[i]
+        for i in keep
+    ]
+
+    plt.close("all")
+
+    # This is SHAP's classic matplotlib force plot.
+    # link="logit" displays the horizontal scale in probability,
+    # matching the classic visual form in the reference image.
+    force_output = shap.force_plot(
+        base_value=float(
+            result["base_poor"]
+        ),
+        shap_values=show_shap,
+        features=show_values,
+        feature_names=show_names,
+        link="logit",
+        matplotlib=True,
+        show=False,
+        figsize=(18, 3.0),
+        contribution_threshold=0.02,
+        text_rotation=0,
+    )
+
+    if hasattr(
+        force_output,
+        "savefig"
     ):
-        next_value = current + shap_value
-        color = "#ff0051" if shap_value > 0 else "#008bfb"
+        fig = force_output
 
-        arrow = FancyArrowPatch(
-            (current, y),
-            (next_value, y),
-            arrowstyle="-|>",
-            mutation_scale=22,
-            linewidth=7,
-            color=color,
-            alpha=0.90,
-            shrinkA=0,
-            shrinkB=0,
-        )
-        ax.add_patch(arrow)
+    else:
+        fig = plt.gcf()
 
-        midpoint = (current + next_value) / 2.0
-        label = feature
-        if raw_value and feature != "Other features":
-            label = f"{feature}={raw_value}"
-
-        ax.text(
-            midpoint,
-            y + 0.12,
-            label,
-            ha="center",
-            va="bottom",
-            fontsize=8.3,
-        )
-
-        current = next_value
-        positions.append(current)
-
-    ax.axvline(base, color="#666666", linestyle="--", linewidth=1.1)
-    ax.axvline(final_margin, color="#111111", linewidth=1.3)
-
-    ax.text(
-        base,
-        0.22,
-        f"Base value\n{sigmoid(base):.1%}",
-        ha="center",
-        va="top",
-        fontsize=9,
-        color="#555555",
-    )
-    ax.text(
-        final_margin,
-        0.22,
-        f"Prediction\n{result['probability_poor']:.1%}",
-        ha="center",
-        va="top",
-        fontsize=10,
-        fontweight="bold",
+    fig.set_size_inches(
+        18,
+        3.0,
+        forward=True,
     )
 
-    xmin, xmax = min(positions), max(positions)
-    span = max(xmax - xmin, 0.5)
-    ax.set_xlim(xmin - 0.15 * span, xmax + 0.15 * span)
-    ax.set_ylim(0.05, 1.00)
-    ax.set_yticks([])
-
-    ax.set_xlabel(
-        "SHAP contribution to poor wound-healing risk (XGBoost log-odds scale)"
-    )
-    ax.set_title("Individual SHAP Force Plot", fontsize=13, fontweight="bold", pad=15)
-
-    ax.text(
-        0.01,
-        0.98,
-        "Red = increases poor wound-healing risk",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-        color="#ff0051",
-        fontweight="bold",
-    )
-    ax.text(
-        0.99,
-        0.98,
-        "Blue = decreases poor wound-healing risk",
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=9,
-        color="#008bfb",
-        fontweight="bold",
+    fig.patch.set_facecolor(
+        "white"
     )
 
-    for spine in ["top", "left", "right"]:
-        ax.spines[spine].set_visible(False)
-    ax.spines["bottom"].set_alpha(0.35)
-
-    fig.tight_layout()
     return fig
 
 
 # ============================================================
-# New-patient form
+# 8. New-patient input
 # ============================================================
 
-with st.form("new_patient_form"):
-    st.subheader("New Patient")
-    left, right = st.columns(2)
-    raw_values = {}
+st.sidebar.header(
+    "📊 Patient Clinical Parameters"
+)
 
-    for i, variable in enumerate(PREDICTORS):
-        meta = CONFIG["ui_metadata"][variable]
-        target_col = left if i % 2 == 0 else right
+st.sidebar.caption(
+    "Enter the new patient's values."
+)
 
-        with target_col:
-            if meta["type"] == "categorical":
-                levels = [str(x) for x in meta["levels"]]
-                default = str(meta.get("default", levels[0]))
-                index = levels.index(default) if default in levels else 0
-                raw_values[variable] = st.selectbox(
-                    clean_label(variable),
-                    options=levels,
-                    index=index,
-                )
-            else:
-                raw_values[variable] = st.number_input(
-                    clean_label(variable),
-                    value=float(meta["default"]),
-                    step=float(meta["step"]),
-                )
-                st.caption(
-                    f"Training range: {float(meta['observed_min']):.2f} – "
-                    f"{float(meta['observed_max']):.2f}"
-                )
 
-    submitted = st.form_submit_button(
-        "Predict Risk",
-        type="primary",
-        width="stretch",
+user_inputs = {}
+
+
+for variable in PREDICTORS:
+
+    meta = CONFIG[
+        "ui_metadata"
+    ][variable]
+
+    label = clean_label(
+        variable
+    )
+
+    if meta[
+        "type"
+    ] == "categorical":
+
+        levels = [
+            str(x)
+            for x in meta[
+                "levels"
+            ]
+        ]
+
+        default = str(
+            meta.get(
+                "default",
+                levels[0]
+            )
+        )
+
+        index = (
+            levels.index(
+                default
+            )
+            if default in levels
+            else 0
+        )
+
+        user_inputs[
+            variable
+        ] = st.sidebar.selectbox(
+            label=label,
+            options=levels,
+            index=index,
+        )
+
+    else:
+
+        user_inputs[
+            variable
+        ] = st.sidebar.number_input(
+            label=label,
+            value=float(
+                meta[
+                    "default"
+                ]
+            ),
+            step=float(
+                meta[
+                    "step"
+                ]
+            ),
+        )
+
+
+clicked = st.sidebar.button(
+    "🚀 Predict Risk",
+    type="primary",
+    width="stretch",
+)
+
+
+# ============================================================
+# 9. Result
+# ============================================================
+
+if clicked:
+
+    try:
+
+        result = predict_and_explain(
+            user_inputs
+        )
+
+        fig = make_classic_force_plot(
+            result,
+            user_inputs,
+        )
+
+    except Exception as exc:
+
+        st.error(
+            f"Prediction failed: {exc}"
+        )
+
+        st.stop()
+
+
+    # --------------------------------------------------------
+    # Prediction Result
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Prediction Result"
+    )
+
+    st.metric(
+        "Probability of poor wound healing",
+        f"{result['probability_poor']:.1%}",
     )
 
 
-# ============================================================
-# Result
-# ============================================================
+    # --------------------------------------------------------
+    # Classic force plot
+    # --------------------------------------------------------
 
-if submitted:
-    try:
-        result = predict_and_explain(raw_values)
-    except Exception as exc:
-        st.error(f"Prediction failed: {exc}")
-        st.stop()
+    st.subheader(
+        "Individualized SHAP Force Plot"
+    )
 
-    st.divider()
-    col1, col2 = st.columns([1, 2])
+    st.pyplot(
+        fig,
+        width="stretch",
+        clear_figure=True,
+    )
 
-    with col1:
-        probability = float(result["probability_poor"])
-        st.subheader("Prediction Result")
-        st.metric("Probability of poor wound healing", f"{probability:.1%}")
-        st.caption(f"Fixed XGBoost threshold for poor wound healing: {THRESHOLD_POOR:.3f}")
 
-        if probability >= THRESHOLD_POOR:
-            st.error("Predicted outcome: **Poor wound healing**")
-        else:
-            st.success("Predicted outcome: **Wound healing**")
-
-    with col2:
-        st.subheader("Individualized SHAP Force Plot")
-        fig = make_force_plot(result, raw_values)
-        st.pyplot(fig, width="stretch", clear_figure=False)
-        st.caption(
-            "Red features increase the predicted risk of poor wound healing; "
-            "blue features decrease the predicted risk."
-        )
-
-        png = io.BytesIO()
-        fig.savefig(
-            png,
-            format="png",
-            dpi=600,
-            bbox_inches="tight",
-            facecolor="white",
-        )
-        png.seek(0)
-        st.download_button(
-            "Download force plot (600 dpi PNG)",
-            data=png,
-            file_name="Poor_Wound_Healing_SHAP_ForcePlot.png",
-            mime="image/png",
-        )
 else:
-    st.info("Enter the patient's values and click Predict Risk.")
+
+    st.info(
+        "👈 Enter the patient's clinical parameters "
+        "and click [Predict Risk]."
+    )
