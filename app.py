@@ -3,15 +3,16 @@
 #
 # Final R-trained XGBoost -> pure Python Streamlit deployment
 #
-# Web target:
-#   Probability of POOR WOUND HEALING
+# Target:
+#   FAVORABLE WOUND HEALING
+#   = P(Wound_Healing = yes)
 #
 # Display:
-#   - Prediction Result
-#   - Probability of poor wound healing
-#   - Classic SHAP force plot
+#   Prediction Result
+#   Probability of favorable wound healing
+#   Stable classic SHAP-style force plot
 #
-# Required files in the same folder:
+# Required files:
 #   app.py
 #   xgb_final_model.json
 #   preprocess_config.json
@@ -23,8 +24,8 @@ import math
 import warnings
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
 import numpy as np
-import shap
 import streamlit as st
 import xgboost as xgb
 
@@ -45,20 +46,20 @@ MODEL_FILE = BASE_DIR / "xgb_final_model.json"
 # ============================================================
 
 st.set_page_config(
-    page_title="Poor Wound Healing Prediction",
+    page_title="Favorable Wound Healing Prediction",
     page_icon="🏥",
     layout="wide",
 )
 
-st.title("🏥 Poor Wound Healing Prediction")
+st.title("🏥 Favorable Wound Healing Prediction")
 st.caption(
     "Enter a new patient's clinical characteristics to estimate "
-    "the probability of poor wound healing."
+    "the probability of favorable wound healing."
 )
 
 
 # ============================================================
-# 3. Load model and preprocessing configuration
+# 3. Load assets
 # ============================================================
 
 @st.cache_resource
@@ -90,7 +91,6 @@ def load_assets():
 
 try:
     CONFIG, BOOSTER = load_assets()
-
 except Exception as exc:
     st.error(
         f"Model files could not be loaded: {exc}"
@@ -137,6 +137,20 @@ def sigmoid(x):
     return z / (1.0 + z)
 
 
+def format_value(value):
+
+    try:
+        f = float(value)
+
+        if abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+
+        return f"{f:.2f}".rstrip("0").rstrip(".")
+
+    except Exception:
+        return str(value)
+
+
 # ============================================================
 # 5. Exact preprocessing exported from R
 # ============================================================
@@ -157,7 +171,6 @@ def preprocess_new_patient(raw_values):
                 raw_values[variable]
             )
 
-            # Training-derived 1% / 99% capping
             if variable in CONFIG.get(
                 "cap_lower",
                 {}
@@ -184,7 +197,6 @@ def preprocess_new_patient(raw_values):
                     )
                 )
 
-            # Training-derived standardization
             if variable in CONFIG.get(
                 "scale_means",
                 {}
@@ -234,9 +246,7 @@ def preprocess_new_patient(raw_values):
                 dtype=float,
             )
 
-    if not np.all(
-        np.isfinite(vec)
-    ):
+    if not np.all(np.isfinite(vec)):
         raise ValueError(
             "Preprocessing generated a non-finite model value."
         )
@@ -245,7 +255,7 @@ def preprocess_new_patient(raw_values):
 
 
 # ============================================================
-# 6. Prediction + exact TreeSHAP
+# 6. Prediction + exact XGBoost TreeSHAP
 # ============================================================
 
 def predict_and_explain(raw_values):
@@ -264,45 +274,27 @@ def predict_and_explain(raw_values):
         feature_names=MODEL_FEATURES,
     )
 
-    # Original model predicts P(Wound_Healing = yes)
-    probability_yes = float(
+    # Final model directly predicts favorable healing = yes
+    probability_favorable = float(
         BOOSTER.predict(
             dnew
         )[0]
     )
 
-    # Website target = poor wound healing
-    probability_poor = (
-        1.0 - probability_yes
-    )
-
-    # Exact XGBoost TreeSHAP for original yes class
     contribution = BOOSTER.predict(
         dnew,
         pred_contribs=True,
         approx_contribs=False,
     )[0]
 
-    shap_yes = np.asarray(
+    shap_values = np.asarray(
         contribution[:-1],
         dtype=float,
     )
 
-    base_yes = float(
+    base_margin = float(
         contribution[-1]
     )
-
-    # Convert explanation to poor wound healing.
-    #
-    # p_poor = 1 - sigmoid(margin_yes)
-    #        = sigmoid(-margin_yes)
-    #
-    # Hence:
-    # base_poor = -base_yes
-    # shap_poor = -shap_yes
-
-    shap_poor = -shap_yes
-    base_poor = -base_yes
 
     # Group encoded columns back into original clinical variables
     grouped = {}
@@ -313,19 +305,17 @@ def predict_and_explain(raw_values):
 
     for model_feature, shap_value in zip(
         MODEL_FEATURES,
-        shap_poor,
+        shap_values,
     ):
 
-        original_feature = mapping.get(
+        original = mapping.get(
             model_feature,
             model_feature,
         )
 
-        grouped[
-            original_feature
-        ] = (
+        grouped[original] = (
             grouped.get(
-                original_feature,
+                original,
                 0.0,
             )
             + float(shap_value)
@@ -353,36 +343,41 @@ def predict_and_explain(raw_values):
         dtype=float,
     )
 
-    # Additivity check
-    margin_poor = (
-        base_poor
-        + float(
-            grouped_shap.sum()
-        )
+    # Exact additivity validation
+    reconstructed_margin = (
+        base_margin
+        + float(grouped_shap.sum())
     )
 
     reconstructed_probability = sigmoid(
-        margin_poor
+        reconstructed_margin
     )
 
     if abs(
         reconstructed_probability
-        - probability_poor
+        - probability_favorable
     ) > 1e-5:
         raise ValueError(
             "SHAP additivity check failed."
         )
 
     return {
-        "probability_poor": probability_poor,
-        "base_poor": base_poor,
+        "probability_favorable": probability_favorable,
+        "base_margin": base_margin,
         "groups": groups,
         "grouped_shap": grouped_shap,
     }
 
 
 # ============================================================
-# 7. Classic SHAP force plot
+# 7. Stable classic SHAP-style force plot
+#
+# This does NOT call shap.force_plot().
+# It is drawn directly with Matplotlib so it remains stable on
+# Streamlit Cloud for every patient.
+#
+# Red  = pushes toward favorable wound healing
+# Blue = pushes away from favorable wound healing
 # ============================================================
 
 def make_classic_force_plot(
@@ -397,88 +392,571 @@ def make_classic_force_plot(
         dtype=float,
     )
 
-    feature_names = [
-        clean_label(
-            variable
-        )
-        for variable in groups
-    ]
+    # Sort strongest contributions first
+    order = np.argsort(
+        np.abs(shap_values)
+    )[::-1]
 
-    feature_values = np.asarray(
-        [
-            raw_values.get(
-                variable,
-                ""
-            )
-            for variable in groups
-        ],
-        dtype=object,
+    # Keep top 8 for readability.
+    # Remaining contributions are combined as "Other features".
+    max_display = min(
+        8,
+        len(order)
     )
 
-    # Remove exact-zero contributions from display only.
-    keep = np.where(
-        np.abs(
-            shap_values
-        ) > 1e-12
-    )[0]
+    keep = order[:max_display]
 
-    if len(keep) == 0:
-        keep = np.arange(
-            len(
+    display_names = []
+    display_values = []
+    display_raw = []
+
+    for i in keep:
+
+        display_names.append(
+            clean_label(
+                groups[i]
+            )
+        )
+
+        display_values.append(
+            float(
+                shap_values[i]
+            )
+        )
+
+        display_raw.append(
+            format_value(
+                raw_values.get(
+                    groups[i],
+                    ""
+                )
+            )
+        )
+
+    if len(order) > max_display:
+
+        other_value = float(
+            shap_values[
+                order[max_display:]
+            ].sum()
+        )
+
+        if abs(other_value) > 1e-12:
+
+            display_names.append(
+                "Other features"
+            )
+
+            display_values.append(
+                other_value
+            )
+
+            display_raw.append(
+                ""
+            )
+
+    # Separate positive and negative contributions
+    positive_items = []
+    negative_items = []
+
+    for name, raw, value in zip(
+        display_names,
+        display_raw,
+        display_values,
+    ):
+
+        item = {
+            "name": name,
+            "raw": raw,
+            "value": value,
+        }
+
+        if value >= 0:
+            positive_items.append(item)
+        else:
+            negative_items.append(item)
+
+    # Stronger contributions closer to the prediction marker
+    positive_items.sort(
+        key=lambda x: abs(x["value"])
+    )
+
+    negative_items.sort(
+        key=lambda x: abs(x["value"])
+    )
+
+    base_margin = float(
+        result["base_margin"]
+    )
+
+    final_margin = (
+        base_margin
+        + float(
+            np.sum(
                 shap_values
             )
         )
-
-    show_shap = shap_values[
-        keep
-    ]
-
-    show_values = feature_values[
-        keep
-    ]
-
-    show_names = [
-        feature_names[i]
-        for i in keep
-    ]
-
-    plt.close("all")
-
-    # This is SHAP's classic matplotlib force plot.
-    # link="logit" displays the horizontal scale in probability,
-    # matching the classic visual form in the reference image.
-    force_output = shap.force_plot(
-        base_value=float(
-            result["base_poor"]
-        ),
-        shap_values=show_shap,
-        features=show_values,
-        feature_names=show_names,
-        link="logit",
-        matplotlib=True,
-        show=False,
-        figsize=(18, 3.0),
-        contribution_threshold=0.02,
-        text_rotation=0,
     )
 
-    if hasattr(
-        force_output,
-        "savefig"
-    ):
-        fig = force_output
+    base_prob = sigmoid(
+        base_margin
+    )
 
-    else:
-        fig = plt.gcf()
+    final_prob = float(
+        result[
+            "probability_favorable"
+        ]
+    )
 
-    fig.set_size_inches(
-        18,
-        3.0,
-        forward=True,
+    # --------------------------------------------------------
+    # Convert force geometry to probability-space positions
+    #
+    # We use the cumulative margins transformed through sigmoid,
+    # making the visual axis match probabilities like the
+    # classic SHAP force plot with link="logit".
+    # --------------------------------------------------------
+
+    pos_segments = []
+    neg_segments = []
+
+    current = final_margin
+
+    for item in positive_items:
+
+        previous = (
+            current
+            - item["value"]
+        )
+
+        pos_segments.append(
+            {
+                **item,
+                "x0": sigmoid(previous),
+                "x1": sigmoid(current),
+            }
+        )
+
+        current = previous
+
+    current = final_margin
+
+    for item in negative_items:
+
+        previous = (
+            current
+            - item["value"]
+        )
+
+        neg_segments.append(
+            {
+                **item,
+                "x0": sigmoid(current),
+                "x1": sigmoid(previous),
+            }
+        )
+
+        current = previous
+
+    # --------------------------------------------------------
+    # Figure
+    # --------------------------------------------------------
+
+    fig, ax = plt.subplots(
+        figsize=(18, 3.2)
     )
 
     fig.patch.set_facecolor(
         "white"
+    )
+
+    ax.set_facecolor(
+        "white"
+    )
+
+    y_top = 0.62
+    y_bottom = 0.42
+    notch = 0.010
+
+    RED = "#ff0051"
+    BLUE = "#1e88e5"
+
+    # --------------------------------------------------------
+    # Red segments: increase favorable-healing probability
+    # --------------------------------------------------------
+
+    for k, item in enumerate(
+        pos_segments
+    ):
+
+        left = min(
+            item["x0"],
+            item["x1"]
+        )
+
+        right = max(
+            item["x0"],
+            item["x1"]
+        )
+
+        if right - left < 1e-6:
+            continue
+
+        polygon = Polygon(
+            [
+                (left, y_bottom),
+                (right - notch, y_bottom),
+                (right, (y_bottom + y_top) / 2),
+                (right - notch, y_top),
+                (left, y_top),
+                (
+                    left + min(
+                        notch,
+                        max(
+                            (right-left) * 0.25,
+                            0.001
+                        )
+                    ),
+                    (y_bottom + y_top) / 2
+                ),
+            ],
+            closed=True,
+            facecolor=RED,
+            edgecolor=RED,
+            linewidth=0,
+            alpha=0.98,
+        )
+
+        ax.add_patch(
+            polygon
+        )
+
+        label = item["name"]
+
+        if (
+            item["raw"] != ""
+            and item["name"] != "Other features"
+        ):
+            label += " = " + item["raw"]
+
+        ax.text(
+            (left + right) / 2,
+            y_bottom - 0.055 - 0.055 * (k % 2),
+            label,
+            color=RED,
+            fontsize=10,
+            ha="center",
+            va="top",
+        )
+
+        ax.plot(
+            [
+                (left + right) / 2,
+                (left + right) / 2,
+            ],
+            [
+                y_bottom,
+                y_bottom - 0.035,
+            ],
+            color=RED,
+            linewidth=0.8,
+            alpha=0.5,
+        )
+
+    # --------------------------------------------------------
+    # Blue segments: decrease favorable-healing probability
+    # --------------------------------------------------------
+
+    for k, item in enumerate(
+        neg_segments
+    ):
+
+        left = min(
+            item["x0"],
+            item["x1"]
+        )
+
+        right = max(
+            item["x0"],
+            item["x1"]
+        )
+
+        if right - left < 1e-6:
+            continue
+
+        polygon = Polygon(
+            [
+                (left + notch, y_bottom),
+                (right, y_bottom),
+                (
+                    right - min(
+                        notch,
+                        max(
+                            (right-left) * 0.25,
+                            0.001
+                        )
+                    ),
+                    (y_bottom + y_top) / 2
+                ),
+                (right, y_top),
+                (left + notch, y_top),
+                (left, (y_bottom + y_top) / 2),
+            ],
+            closed=True,
+            facecolor=BLUE,
+            edgecolor=BLUE,
+            linewidth=0,
+            alpha=0.98,
+        )
+
+        ax.add_patch(
+            polygon
+        )
+
+        label = item["name"]
+
+        if (
+            item["raw"] != ""
+            and item["name"] != "Other features"
+        ):
+            label += " = " + item["raw"]
+
+        ax.text(
+            (left + right) / 2,
+            y_bottom - 0.055 - 0.055 * (k % 2),
+            label,
+            color=BLUE,
+            fontsize=10,
+            ha="center",
+            va="top",
+        )
+
+        ax.plot(
+            [
+                (left + right) / 2,
+                (left + right) / 2,
+            ],
+            [
+                y_bottom,
+                y_bottom - 0.035,
+            ],
+            color=BLUE,
+            linewidth=0.8,
+            alpha=0.5,
+        )
+
+    # --------------------------------------------------------
+    # Top axis
+    # --------------------------------------------------------
+
+    ax.axhline(
+        y=y_top + 0.055,
+        color="#888888",
+        linewidth=0.8,
+    )
+
+    # Prediction marker
+    ax.plot(
+        [
+            final_prob,
+            final_prob,
+        ],
+        [
+            y_top + 0.02,
+            y_top + 0.09,
+        ],
+        color="#555555",
+        linewidth=1.0,
+    )
+
+    ax.text(
+        final_prob,
+        y_top + 0.11,
+        "f(x)",
+        ha="center",
+        va="bottom",
+        fontsize=11,
+        color="#777777",
+    )
+
+    ax.text(
+        final_prob,
+        y_top + 0.072,
+        f"{final_prob:.3f}",
+        ha="center",
+        va="bottom",
+        fontsize=15,
+        fontweight="bold",
+        color="black",
+    )
+
+    # Base value marker
+    ax.plot(
+        [
+            base_prob,
+            base_prob,
+        ],
+        [
+            y_top + 0.02,
+            y_top + 0.09,
+        ],
+        color="#888888",
+        linewidth=0.9,
+        alpha=0.8,
+    )
+
+    ax.text(
+        base_prob,
+        y_top + 0.11,
+        "base value",
+        ha="center",
+        va="bottom",
+        fontsize=10.5,
+        color="#777777",
+    )
+
+    ax.text(
+        base_prob,
+        y_top + 0.072,
+        f"{base_prob:.3f}",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+        color="#777777",
+    )
+
+    # higher / lower
+    center = (
+        final_prob + base_prob
+    ) / 2
+
+    ax.text(
+        center - 0.025,
+        0.955,
+        "higher",
+        transform=ax.get_xaxis_transform(),
+        color=RED,
+        fontsize=11,
+        ha="right",
+        va="top",
+    )
+
+    ax.text(
+        center,
+        0.955,
+        "↔",
+        transform=ax.get_xaxis_transform(),
+        color="#777777",
+        fontsize=11,
+        ha="center",
+        va="top",
+    )
+
+    ax.text(
+        center + 0.025,
+        0.955,
+        "lower",
+        transform=ax.get_xaxis_transform(),
+        color=BLUE,
+        fontsize=11,
+        ha="left",
+        va="top",
+    )
+
+    # --------------------------------------------------------
+    # Probability ticks
+    # --------------------------------------------------------
+
+    all_x = [
+        final_prob,
+        base_prob,
+    ]
+
+    for item in pos_segments + neg_segments:
+        all_x.extend(
+            [
+                item["x0"],
+                item["x1"],
+            ]
+        )
+
+    xmin = max(
+        0.0,
+        min(all_x) - 0.08
+    )
+
+    xmax = min(
+        1.0,
+        max(all_x) + 0.08
+    )
+
+    # Avoid overly narrow plot ranges
+    if xmax - xmin < 0.35:
+
+        mid = (
+            xmin + xmax
+        ) / 2
+
+        xmin = max(
+            0.0,
+            mid - 0.175
+        )
+
+        xmax = min(
+            1.0,
+            mid + 0.175
+        )
+
+    ticks = np.linspace(
+        xmin,
+        xmax,
+        9
+    )
+
+    ax.set_xticks(
+        ticks
+    )
+
+    ax.set_xticklabels(
+        [
+            f"{x:.3f}".rstrip("0").rstrip(".")
+            for x in ticks
+        ],
+        fontsize=9,
+        color="#777777",
+    )
+
+    ax.tick_params(
+        axis="x",
+        top=True,
+        labeltop=True,
+        bottom=False,
+        labelbottom=False,
+        length=3,
+        color="#999999",
+        pad=2,
+    )
+
+    ax.set_xlim(
+        xmin,
+        xmax
+    )
+
+    ax.set_ylim(
+        0.02,
+        1.0
+    )
+
+    ax.set_yticks(
+        []
+    )
+
+    for spine in ax.spines.values():
+        spine.set_visible(
+            False
+        )
+
+    fig.tight_layout(
+        pad=0.6
     )
 
     return fig
@@ -496,9 +974,7 @@ st.sidebar.caption(
     "Enter the new patient's values."
 )
 
-
 user_inputs = {}
-
 
 for variable in PREDICTORS:
 
@@ -510,9 +986,7 @@ for variable in PREDICTORS:
         variable
     )
 
-    if meta[
-        "type"
-    ] == "categorical":
+    if meta["type"] == "categorical":
 
         levels = [
             str(x)
@@ -551,20 +1025,15 @@ for variable in PREDICTORS:
         ] = st.sidebar.number_input(
             label=label,
             value=float(
-                meta[
-                    "default"
-                ]
+                meta["default"]
             ),
             step=float(
-                meta[
-                    "step"
-                ]
+                meta["step"]
             ),
         )
 
-
 clicked = st.sidebar.button(
-    "🚀 Predict Risk",
+    "🚀 Predict",
     type="primary",
     width="stretch",
 )
@@ -596,23 +1065,14 @@ if clicked:
         st.stop()
 
 
-    # --------------------------------------------------------
-    # Prediction Result
-    # --------------------------------------------------------
-
     st.subheader(
         "Prediction Result"
     )
 
     st.metric(
-        "Probability of poor wound healing",
-        f"{result['probability_poor']:.1%}",
+        "Probability of favorable wound healing",
+        f"{result['probability_favorable']:.1%}",
     )
-
-
-    # --------------------------------------------------------
-    # Classic force plot
-    # --------------------------------------------------------
 
     st.subheader(
         "Individualized SHAP Force Plot"
@@ -624,10 +1084,9 @@ if clicked:
         clear_figure=True,
     )
 
-
 else:
 
     st.info(
         "👈 Enter the patient's clinical parameters "
-        "and click [Predict Risk]."
+        "and click [Predict]."
     )
