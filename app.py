@@ -3,14 +3,22 @@
 #
 # Final R-trained XGBoost -> pure Python Streamlit deployment
 #
-# Target:
-#   FAVORABLE WOUND HEALING
-#   = P(Wound_Healing = yes)
+# Target shown by website:
+#   POOR WOUND HEALING
 #
-# Display:
-#   Prediction Result
-#   Probability of favorable wound healing
-#   Stable classic SHAP-style force plot
+# IMPORTANT:
+# Original final XGBoost predicts:
+#   P(Wound_Healing = yes) = favorable wound healing
+#
+# Therefore website uses:
+#   P(poor wound healing) = 1 - P(favorable wound healing)
+#
+# SHAP direction MUST also be reversed:
+#   SHAP_poor = -SHAP_favorable
+#   base_poor = -base_favorable
+#
+# Red  = increases poor wound-healing probability
+# Blue = decreases poor wound-healing probability
 #
 # Required files:
 #   app.py
@@ -46,20 +54,20 @@ MODEL_FILE = BASE_DIR / "xgb_final_model.json"
 # ============================================================
 
 st.set_page_config(
-    page_title="Favorable Wound Healing Prediction",
+    page_title="Poor Wound Healing Prediction",
     page_icon="🏥",
     layout="wide",
 )
 
-st.title("🏥 Favorable Wound Healing Prediction")
+st.title("🏥 Poor Wound Healing Prediction")
 st.caption(
     "Enter a new patient's clinical characteristics to estimate "
-    "the probability of favorable wound healing."
+    "the probability of poor wound healing."
 )
 
 
 # ============================================================
-# 3. Load assets
+# 3. Load final model and preprocessing
 # ============================================================
 
 @st.cache_resource
@@ -171,6 +179,7 @@ def preprocess_new_patient(raw_values):
                 raw_values[variable]
             )
 
+            # Training-derived capping
             if variable in CONFIG.get(
                 "cap_lower",
                 {}
@@ -197,6 +206,7 @@ def preprocess_new_patient(raw_values):
                     )
                 )
 
+            # Training-derived standardization
             if variable in CONFIG.get(
                 "scale_means",
                 {}
@@ -255,7 +265,7 @@ def preprocess_new_patient(raw_values):
 
 
 # ============================================================
-# 6. Prediction + exact XGBoost TreeSHAP
+# 6. Prediction + TreeSHAP converted to POOR wound healing
 # ============================================================
 
 def predict_and_explain(raw_values):
@@ -274,12 +284,29 @@ def predict_and_explain(raw_values):
         feature_names=MODEL_FEATURES,
     )
 
-    # Final model directly predicts favorable healing = yes
+    # --------------------------------------------------------
+    # Original final XGBoost:
+    # probability of favorable wound healing (yes)
+    # --------------------------------------------------------
+
     probability_favorable = float(
         BOOSTER.predict(
             dnew
         )[0]
     )
+
+    # --------------------------------------------------------
+    # Website target:
+    # probability of POOR wound healing
+    # --------------------------------------------------------
+
+    probability_poor = (
+        1.0 - probability_favorable
+    )
+
+    # --------------------------------------------------------
+    # Native TreeSHAP from XGBoost is for favorable=yes margin
+    # --------------------------------------------------------
 
     contribution = BOOSTER.predict(
         dnew,
@@ -287,16 +314,36 @@ def predict_and_explain(raw_values):
         approx_contribs=False,
     )[0]
 
-    shap_values = np.asarray(
+    shap_favorable = np.asarray(
         contribution[:-1],
         dtype=float,
     )
 
-    base_margin = float(
+    base_favorable = float(
         contribution[-1]
     )
 
-    # Group encoded columns back into original clinical variables
+    # --------------------------------------------------------
+    # CRITICAL DIRECTION CONVERSION
+    #
+    # p_favorable = sigmoid(margin)
+    # p_poor      = 1 - sigmoid(margin)
+    #             = sigmoid(-margin)
+    #
+    # So every component of the additive explanation must flip:
+    #
+    # margin_poor = -margin_favorable
+    # base_poor   = -base_favorable
+    # SHAP_poor   = -SHAP_favorable
+    # --------------------------------------------------------
+
+    shap_poor = -shap_favorable
+    base_poor = -base_favorable
+
+    # --------------------------------------------------------
+    # Group encoded columns back to original clinical variables
+    # --------------------------------------------------------
+
     grouped = {}
 
     mapping = CONFIG[
@@ -305,7 +352,7 @@ def predict_and_explain(raw_values):
 
     for model_feature, shap_value in zip(
         MODEL_FEATURES,
-        shap_values,
+        shap_poor,
     ):
 
         original = mapping.get(
@@ -343,27 +390,33 @@ def predict_and_explain(raw_values):
         dtype=float,
     )
 
-    # Exact additivity validation
-    reconstructed_margin = (
-        base_margin
-        + float(grouped_shap.sum())
+    # --------------------------------------------------------
+    # Additivity check on the POOR-wound-healing scale
+    # --------------------------------------------------------
+
+    margin_poor = (
+        base_poor
+        + float(
+            grouped_shap.sum()
+        )
     )
 
-    reconstructed_probability = sigmoid(
-        reconstructed_margin
+    reconstructed_probability_poor = sigmoid(
+        margin_poor
     )
 
     if abs(
-        reconstructed_probability
-        - probability_favorable
+        reconstructed_probability_poor
+        - probability_poor
     ) > 1e-5:
+
         raise ValueError(
-            "SHAP additivity check failed."
+            "Poor-wound-healing SHAP conversion failed additivity check."
         )
 
     return {
-        "probability_favorable": probability_favorable,
-        "base_margin": base_margin,
+        "probability_poor": probability_poor,
+        "base_poor": base_poor,
         "groups": groups,
         "grouped_shap": grouped_shap,
     }
@@ -372,12 +425,9 @@ def predict_and_explain(raw_values):
 # ============================================================
 # 7. Stable classic SHAP-style force plot
 #
-# This does NOT call shap.force_plot().
-# It is drawn directly with Matplotlib so it remains stable on
-# Streamlit Cloud for every patient.
-#
-# Red  = pushes toward favorable wound healing
-# Blue = pushes away from favorable wound healing
+# IMPORTANT DIRECTION:
+#   Positive SHAP -> RED  -> increases poor wound-healing risk
+#   Negative SHAP -> BLUE -> decreases poor wound-healing risk
 # ============================================================
 
 def make_classic_force_plot(
@@ -392,13 +442,10 @@ def make_classic_force_plot(
         dtype=float,
     )
 
-    # Sort strongest contributions first
     order = np.argsort(
         np.abs(shap_values)
     )[::-1]
 
-    # Keep top 8 for readability.
-    # Remaining contributions are combined as "Other features".
     max_display = min(
         8,
         len(order)
@@ -455,7 +502,6 @@ def make_classic_force_plot(
                 ""
             )
 
-    # Separate positive and negative contributions
     positive_items = []
     negative_items = []
 
@@ -471,22 +517,34 @@ def make_classic_force_plot(
             "value": value,
         }
 
+        # Positive poor-wound-healing SHAP = RED
         if value >= 0:
-            positive_items.append(item)
-        else:
-            negative_items.append(item)
+            positive_items.append(
+                item
+            )
 
-    # Stronger contributions closer to the prediction marker
+        # Negative poor-wound-healing SHAP = BLUE
+        else:
+            negative_items.append(
+                item
+            )
+
     positive_items.sort(
-        key=lambda x: abs(x["value"])
+        key=lambda x: abs(
+            x["value"]
+        )
     )
 
     negative_items.sort(
-        key=lambda x: abs(x["value"])
+        key=lambda x: abs(
+            x["value"]
+        )
     )
 
     base_margin = float(
-        result["base_margin"]
+        result[
+            "base_poor"
+        ]
     )
 
     final_margin = (
@@ -504,16 +562,12 @@ def make_classic_force_plot(
 
     final_prob = float(
         result[
-            "probability_favorable"
+            "probability_poor"
         ]
     )
 
     # --------------------------------------------------------
-    # Convert force geometry to probability-space positions
-    #
-    # We use the cumulative margins transformed through sigmoid,
-    # making the visual axis match probabilities like the
-    # classic SHAP force plot with link="logit".
+    # Build cumulative probability-space segments
     # --------------------------------------------------------
 
     pos_segments = []
@@ -531,8 +585,12 @@ def make_classic_force_plot(
         pos_segments.append(
             {
                 **item,
-                "x0": sigmoid(previous),
-                "x1": sigmoid(current),
+                "x0": sigmoid(
+                    previous
+                ),
+                "x1": sigmoid(
+                    current
+                ),
             }
         )
 
@@ -550,8 +608,12 @@ def make_classic_force_plot(
         neg_segments.append(
             {
                 **item,
-                "x0": sigmoid(current),
-                "x1": sigmoid(previous),
+                "x0": sigmoid(
+                    current
+                ),
+                "x1": sigmoid(
+                    previous
+                ),
             }
         )
 
@@ -562,7 +624,10 @@ def make_classic_force_plot(
     # --------------------------------------------------------
 
     fig, ax = plt.subplots(
-        figsize=(18, 3.2)
+        figsize=(
+            18,
+            3.2
+        )
     )
 
     fig.patch.set_facecolor(
@@ -581,7 +646,7 @@ def make_classic_force_plot(
     BLUE = "#1e88e5"
 
     # --------------------------------------------------------
-    # Red segments: increase favorable-healing probability
+    # RED: increases POOR wound-healing probability
     # --------------------------------------------------------
 
     for k, item in enumerate(
@@ -601,21 +666,26 @@ def make_classic_force_plot(
         if right - left < 1e-6:
             continue
 
+        local_notch = min(
+            notch,
+            max(
+                (right - left) * 0.25,
+                0.001
+            )
+        )
+
         polygon = Polygon(
             [
                 (left, y_bottom),
-                (right - notch, y_bottom),
-                (right, (y_bottom + y_top) / 2),
-                (right - notch, y_top),
+                (right - local_notch, y_bottom),
+                (
+                    right,
+                    (y_bottom + y_top) / 2
+                ),
+                (right - local_notch, y_top),
                 (left, y_top),
                 (
-                    left + min(
-                        notch,
-                        max(
-                            (right-left) * 0.25,
-                            0.001
-                        )
-                    ),
+                    left + local_notch,
                     (y_bottom + y_top) / 2
                 ),
             ],
@@ -636,10 +706,17 @@ def make_classic_force_plot(
             item["raw"] != ""
             and item["name"] != "Other features"
         ):
-            label += " = " + item["raw"]
+            label += (
+                " = "
+                + item["raw"]
+            )
+
+        midpoint = (
+            left + right
+        ) / 2
 
         ax.text(
-            (left + right) / 2,
+            midpoint,
             y_bottom - 0.055 - 0.055 * (k % 2),
             label,
             color=RED,
@@ -650,8 +727,8 @@ def make_classic_force_plot(
 
         ax.plot(
             [
-                (left + right) / 2,
-                (left + right) / 2,
+                midpoint,
+                midpoint,
             ],
             [
                 y_bottom,
@@ -663,7 +740,7 @@ def make_classic_force_plot(
         )
 
     # --------------------------------------------------------
-    # Blue segments: decrease favorable-healing probability
+    # BLUE: decreases POOR wound-healing probability
     # --------------------------------------------------------
 
     for k, item in enumerate(
@@ -683,23 +760,28 @@ def make_classic_force_plot(
         if right - left < 1e-6:
             continue
 
+        local_notch = min(
+            notch,
+            max(
+                (right - left) * 0.25,
+                0.001
+            )
+        )
+
         polygon = Polygon(
             [
-                (left + notch, y_bottom),
+                (left + local_notch, y_bottom),
                 (right, y_bottom),
                 (
-                    right - min(
-                        notch,
-                        max(
-                            (right-left) * 0.25,
-                            0.001
-                        )
-                    ),
+                    right - local_notch,
                     (y_bottom + y_top) / 2
                 ),
                 (right, y_top),
-                (left + notch, y_top),
-                (left, (y_bottom + y_top) / 2),
+                (left + local_notch, y_top),
+                (
+                    left,
+                    (y_bottom + y_top) / 2
+                ),
             ],
             closed=True,
             facecolor=BLUE,
@@ -718,10 +800,17 @@ def make_classic_force_plot(
             item["raw"] != ""
             and item["name"] != "Other features"
         ):
-            label += " = " + item["raw"]
+            label += (
+                " = "
+                + item["raw"]
+            )
+
+        midpoint = (
+            left + right
+        ) / 2
 
         ax.text(
-            (left + right) / 2,
+            midpoint,
             y_bottom - 0.055 - 0.055 * (k % 2),
             label,
             color=BLUE,
@@ -732,8 +821,8 @@ def make_classic_force_plot(
 
         ax.plot(
             [
-                (left + right) / 2,
-                (left + right) / 2,
+                midpoint,
+                midpoint,
             ],
             [
                 y_bottom,
@@ -745,7 +834,7 @@ def make_classic_force_plot(
         )
 
     # --------------------------------------------------------
-    # Top axis
+    # Classic SHAP top line
     # --------------------------------------------------------
 
     ax.axhline(
@@ -754,7 +843,7 @@ def make_classic_force_plot(
         linewidth=0.8,
     )
 
-    # Prediction marker
+    # f(x) = current poor wound-healing probability
     ax.plot(
         [
             final_prob,
@@ -789,7 +878,7 @@ def make_classic_force_plot(
         color="black",
     )
 
-    # Base value marker
+    # Base value on poor-wound-healing probability scale
     ax.plot(
         [
             base_prob,
@@ -824,7 +913,9 @@ def make_classic_force_plot(
         color="#777777",
     )
 
-    # higher / lower
+    # Explicit meaning:
+    # higher = higher POOR wound-healing probability
+    # lower  = lower POOR wound-healing probability
     center = (
         final_prob + base_prob
     ) / 2
@@ -863,7 +954,7 @@ def make_classic_force_plot(
     )
 
     # --------------------------------------------------------
-    # Probability ticks
+    # Probability axis
     # --------------------------------------------------------
 
     all_x = [
@@ -871,7 +962,10 @@ def make_classic_force_plot(
         base_prob,
     ]
 
-    for item in pos_segments + neg_segments:
+    for item in (
+        pos_segments
+        + neg_segments
+    ):
         all_x.extend(
             [
                 item["x0"],
@@ -889,7 +983,6 @@ def make_classic_force_plot(
         max(all_x) + 0.08
     )
 
-    # Avoid overly narrow plot ranges
     if xmax - xmin < 0.35:
 
         mid = (
@@ -1032,6 +1125,7 @@ for variable in PREDICTORS:
             ),
         )
 
+
 clicked = st.sidebar.button(
     "🚀 Predict",
     type="primary",
@@ -1070,8 +1164,8 @@ if clicked:
     )
 
     st.metric(
-        "Probability of favorable wound healing",
-        f"{result['probability_favorable']:.1%}",
+        "Probability of poor wound healing",
+        f"{result['probability_poor']:.1%}",
     )
 
     st.subheader(
