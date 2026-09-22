@@ -1,29 +1,22 @@
 # ============================================================
 # app.py
 #
-# Final R-trained XGBoost -> pure Python Streamlit deployment
-#
-# Target shown by website:
-#   POOR WOUND HEALING
+# Final XGBoost -> Streamlit
 #
 # IMPORTANT:
-# Original final XGBoost predicts:
-#   P(Wound_Healing = yes) = favorable wound healing
+# The exported Booster's native output is treated as:
+#   P(POOR WOUND HEALING)
 #
-# Therefore website uses:
-#   P(poor wound healing) = 1 - P(favorable wound healing)
+# Therefore:
+#   probability_poor = BOOSTER.predict(...)
+#   SHAP_poor        = native TreeSHAP
+#   base_poor        = native TreeSHAP base value
 #
-# SHAP direction MUST also be reversed:
-#   SHAP_poor = -SHAP_favorable
-#   base_poor = -base_favorable
+# NO 1-p conversion
+# NO sign inversion
 #
 # Red  = increases poor wound-healing probability
 # Blue = decreases poor wound-healing probability
-#
-# Required files:
-#   app.py
-#   xgb_final_model.json
-#   preprocess_config.json
 # ============================================================
 
 from pathlib import Path
@@ -67,7 +60,7 @@ st.caption(
 
 
 # ============================================================
-# 3. Load final model and preprocessing
+# 3. Load assets
 # ============================================================
 
 @st.cache_resource
@@ -160,7 +153,7 @@ def format_value(value):
 
 
 # ============================================================
-# 5. Exact preprocessing exported from R
+# 5. Exact preprocessing
 # ============================================================
 
 def preprocess_new_patient(raw_values):
@@ -179,7 +172,6 @@ def preprocess_new_patient(raw_values):
                 raw_values[variable]
             )
 
-            # Training-derived capping
             if variable in CONFIG.get(
                 "cap_lower",
                 {}
@@ -206,11 +198,11 @@ def preprocess_new_patient(raw_values):
                     )
                 )
 
-            # Training-derived standardization
             if variable in CONFIG.get(
                 "scale_means",
                 {}
             ):
+
                 mean = float(
                     CONFIG[
                         "scale_means"
@@ -256,7 +248,9 @@ def preprocess_new_patient(raw_values):
                 dtype=float,
             )
 
-    if not np.all(np.isfinite(vec)):
+    if not np.all(
+        np.isfinite(vec)
+    ):
         raise ValueError(
             "Preprocessing generated a non-finite model value."
         )
@@ -265,7 +259,7 @@ def preprocess_new_patient(raw_values):
 
 
 # ============================================================
-# 6. Prediction + TreeSHAP converted to POOR wound healing
+# 6. Prediction + native TreeSHAP
 # ============================================================
 
 def predict_and_explain(raw_values):
@@ -285,60 +279,31 @@ def predict_and_explain(raw_values):
     )
 
     # --------------------------------------------------------
-    # Original final XGBoost:
-    # probability of favorable wound healing (yes)
+    # CRITICAL FIX:
+    # Native Booster output is used directly as POOR outcome.
     # --------------------------------------------------------
 
-    probability_favorable = float(
+    probability_poor = float(
         BOOSTER.predict(
             dnew
         )[0]
     )
 
-    # --------------------------------------------------------
-    # Website target:
-    # probability of POOR wound healing
-    # --------------------------------------------------------
-
-    probability_poor = (
-        1.0 - probability_favorable
-    )
-
-    # --------------------------------------------------------
-    # Native TreeSHAP from XGBoost is for favorable=yes margin
-    # --------------------------------------------------------
-
+    # Native TreeSHAP is therefore already on the POOR direction.
     contribution = BOOSTER.predict(
         dnew,
         pred_contribs=True,
         approx_contribs=False,
     )[0]
 
-    shap_favorable = np.asarray(
+    shap_poor = np.asarray(
         contribution[:-1],
         dtype=float,
     )
 
-    base_favorable = float(
+    base_poor = float(
         contribution[-1]
     )
-
-    # --------------------------------------------------------
-    # CRITICAL DIRECTION CONVERSION
-    #
-    # p_favorable = sigmoid(margin)
-    # p_poor      = 1 - sigmoid(margin)
-    #             = sigmoid(-margin)
-    #
-    # So every component of the additive explanation must flip:
-    #
-    # margin_poor = -margin_favorable
-    # base_poor   = -base_favorable
-    # SHAP_poor   = -SHAP_favorable
-    # --------------------------------------------------------
-
-    shap_poor = -shap_favorable
-    base_poor = -base_favorable
 
     # --------------------------------------------------------
     # Group encoded columns back to original clinical variables
@@ -391,7 +356,7 @@ def predict_and_explain(raw_values):
     )
 
     # --------------------------------------------------------
-    # Additivity check on the POOR-wound-healing scale
+    # Additivity check
     # --------------------------------------------------------
 
     margin_poor = (
@@ -401,17 +366,17 @@ def predict_and_explain(raw_values):
         )
     )
 
-    reconstructed_probability_poor = sigmoid(
+    reconstructed_probability = sigmoid(
         margin_poor
     )
 
     if abs(
-        reconstructed_probability_poor
+        reconstructed_probability
         - probability_poor
     ) > 1e-5:
 
         raise ValueError(
-            "Poor-wound-healing SHAP conversion failed additivity check."
+            "SHAP additivity check failed."
         )
 
     return {
@@ -425,9 +390,8 @@ def predict_and_explain(raw_values):
 # ============================================================
 # 7. Stable classic SHAP-style force plot
 #
-# IMPORTANT DIRECTION:
-#   Positive SHAP -> RED  -> increases poor wound-healing risk
-#   Negative SHAP -> BLUE -> decreases poor wound-healing risk
+# Positive SHAP = RED  = increases POOR risk
+# Negative SHAP = BLUE = decreases POOR risk
 # ============================================================
 
 def make_classic_force_plot(
@@ -435,15 +399,21 @@ def make_classic_force_plot(
     raw_values,
 ):
 
-    groups = result["groups"]
+    groups = result[
+        "groups"
+    ]
 
     shap_values = np.asarray(
-        result["grouped_shap"],
+        result[
+            "grouped_shap"
+        ],
         dtype=float,
     )
 
     order = np.argsort(
-        np.abs(shap_values)
+        np.abs(
+            shap_values
+        )
     )[::-1]
 
     max_display = min(
@@ -451,7 +421,9 @@ def make_classic_force_plot(
         len(order)
     )
 
-    keep = order[:max_display]
+    keep = order[
+        :max_display
+    ]
 
     display_names = []
     display_values = []
@@ -484,11 +456,15 @@ def make_classic_force_plot(
 
         other_value = float(
             shap_values[
-                order[max_display:]
+                order[
+                    max_display:
+                ]
             ].sum()
         )
 
-        if abs(other_value) > 1e-12:
+        if abs(
+            other_value
+        ) > 1e-12:
 
             display_names.append(
                 "Other features"
@@ -517,13 +493,10 @@ def make_classic_force_plot(
             "value": value,
         }
 
-        # Positive poor-wound-healing SHAP = RED
         if value >= 0:
             positive_items.append(
                 item
             )
-
-        # Negative poor-wound-healing SHAP = BLUE
         else:
             negative_items.append(
                 item
@@ -567,7 +540,7 @@ def make_classic_force_plot(
     )
 
     # --------------------------------------------------------
-    # Build cumulative probability-space segments
+    # Build red and blue force segments
     # --------------------------------------------------------
 
     pos_segments = []
@@ -579,7 +552,9 @@ def make_classic_force_plot(
 
         previous = (
             current
-            - item["value"]
+            - item[
+                "value"
+            ]
         )
 
         pos_segments.append(
@@ -602,7 +577,9 @@ def make_classic_force_plot(
 
         previous = (
             current
-            - item["value"]
+            - item[
+                "value"
+            ]
         )
 
         neg_segments.append(
@@ -645,10 +622,7 @@ def make_classic_force_plot(
     RED = "#ff0051"
     BLUE = "#1e88e5"
 
-    # --------------------------------------------------------
-    # RED: increases POOR wound-healing probability
-    # --------------------------------------------------------
-
+    # RED = positive SHAP = higher poor risk
     for k, item in enumerate(
         pos_segments
     ):
@@ -663,30 +637,60 @@ def make_classic_force_plot(
             item["x1"]
         )
 
-        if right - left < 1e-6:
+        if (
+            right - left
+            < 1e-6
+        ):
             continue
 
         local_notch = min(
             notch,
             max(
-                (right - left) * 0.25,
+                (
+                    right
+                    - left
+                )
+                * 0.25,
                 0.001
             )
         )
 
         polygon = Polygon(
             [
-                (left, y_bottom),
-                (right - local_notch, y_bottom),
+                (
+                    left,
+                    y_bottom
+                ),
+                (
+                    right
+                    - local_notch,
+                    y_bottom
+                ),
                 (
                     right,
-                    (y_bottom + y_top) / 2
+                    (
+                        y_bottom
+                        + y_top
+                    )
+                    / 2
                 ),
-                (right - local_notch, y_top),
-                (left, y_top),
                 (
-                    left + local_notch,
-                    (y_bottom + y_top) / 2
+                    right
+                    - local_notch,
+                    y_top
+                ),
+                (
+                    left,
+                    y_top
+                ),
+                (
+                    left
+                    + local_notch,
+                    (
+                        y_bottom
+                        + y_top
+                    )
+                    / 2
                 ),
             ],
             closed=True,
@@ -700,24 +704,37 @@ def make_classic_force_plot(
             polygon
         )
 
-        label = item["name"]
+        label = item[
+            "name"
+        ]
 
         if (
             item["raw"] != ""
-            and item["name"] != "Other features"
+            and
+            item["name"]
+            != "Other features"
         ):
+
             label += (
                 " = "
-                + item["raw"]
+                + item[
+                    "raw"
+                ]
             )
 
         midpoint = (
-            left + right
+            left
+            + right
         ) / 2
 
         ax.text(
             midpoint,
-            y_bottom - 0.055 - 0.055 * (k % 2),
+            y_bottom
+            - 0.055
+            - 0.055
+            * (
+                k % 2
+            ),
             label,
             color=RED,
             fontsize=10,
@@ -732,17 +749,15 @@ def make_classic_force_plot(
             ],
             [
                 y_bottom,
-                y_bottom - 0.035,
+                y_bottom
+                - 0.035,
             ],
             color=RED,
             linewidth=0.8,
             alpha=0.5,
         )
 
-    # --------------------------------------------------------
-    # BLUE: decreases POOR wound-healing probability
-    # --------------------------------------------------------
-
+    # BLUE = negative SHAP = lower poor risk
     for k, item in enumerate(
         neg_segments
     ):
@@ -757,30 +772,60 @@ def make_classic_force_plot(
             item["x1"]
         )
 
-        if right - left < 1e-6:
+        if (
+            right - left
+            < 1e-6
+        ):
             continue
 
         local_notch = min(
             notch,
             max(
-                (right - left) * 0.25,
+                (
+                    right
+                    - left
+                )
+                * 0.25,
                 0.001
             )
         )
 
         polygon = Polygon(
             [
-                (left + local_notch, y_bottom),
-                (right, y_bottom),
                 (
-                    right - local_notch,
-                    (y_bottom + y_top) / 2
+                    left
+                    + local_notch,
+                    y_bottom
                 ),
-                (right, y_top),
-                (left + local_notch, y_top),
+                (
+                    right,
+                    y_bottom
+                ),
+                (
+                    right
+                    - local_notch,
+                    (
+                        y_bottom
+                        + y_top
+                    )
+                    / 2
+                ),
+                (
+                    right,
+                    y_top
+                ),
+                (
+                    left
+                    + local_notch,
+                    y_top
+                ),
                 (
                     left,
-                    (y_bottom + y_top) / 2
+                    (
+                        y_bottom
+                        + y_top
+                    )
+                    / 2
                 ),
             ],
             closed=True,
@@ -794,24 +839,37 @@ def make_classic_force_plot(
             polygon
         )
 
-        label = item["name"]
+        label = item[
+            "name"
+        ]
 
         if (
             item["raw"] != ""
-            and item["name"] != "Other features"
+            and
+            item["name"]
+            != "Other features"
         ):
+
             label += (
                 " = "
-                + item["raw"]
+                + item[
+                    "raw"
+                ]
             )
 
         midpoint = (
-            left + right
+            left
+            + right
         ) / 2
 
         ax.text(
             midpoint,
-            y_bottom - 0.055 - 0.055 * (k % 2),
+            y_bottom
+            - 0.055
+            - 0.055
+            * (
+                k % 2
+            ),
             label,
             color=BLUE,
             fontsize=10,
@@ -826,7 +884,8 @@ def make_classic_force_plot(
             ],
             [
                 y_bottom,
-                y_bottom - 0.035,
+                y_bottom
+                - 0.035,
             ],
             color=BLUE,
             linewidth=0.8,
@@ -834,24 +893,27 @@ def make_classic_force_plot(
         )
 
     # --------------------------------------------------------
-    # Classic SHAP top line
+    # Classic top axis
     # --------------------------------------------------------
 
     ax.axhline(
-        y=y_top + 0.055,
+        y=y_top
+        + 0.055,
         color="#888888",
         linewidth=0.8,
     )
 
-    # f(x) = current poor wound-healing probability
+    # f(x) = predicted poor probability
     ax.plot(
         [
             final_prob,
             final_prob,
         ],
         [
-            y_top + 0.02,
-            y_top + 0.09,
+            y_top
+            + 0.02,
+            y_top
+            + 0.09,
         ],
         color="#555555",
         linewidth=1.0,
@@ -859,7 +921,8 @@ def make_classic_force_plot(
 
     ax.text(
         final_prob,
-        y_top + 0.11,
+        y_top
+        + 0.11,
         "f(x)",
         ha="center",
         va="bottom",
@@ -869,7 +932,8 @@ def make_classic_force_plot(
 
     ax.text(
         final_prob,
-        y_top + 0.072,
+        y_top
+        + 0.072,
         f"{final_prob:.3f}",
         ha="center",
         va="bottom",
@@ -878,15 +942,17 @@ def make_classic_force_plot(
         color="black",
     )
 
-    # Base value on poor-wound-healing probability scale
+    # Base value
     ax.plot(
         [
             base_prob,
             base_prob,
         ],
         [
-            y_top + 0.02,
-            y_top + 0.09,
+            y_top
+            + 0.02,
+            y_top
+            + 0.09,
         ],
         color="#888888",
         linewidth=0.9,
@@ -895,7 +961,8 @@ def make_classic_force_plot(
 
     ax.text(
         base_prob,
-        y_top + 0.11,
+        y_top
+        + 0.11,
         "base value",
         ha="center",
         va="bottom",
@@ -905,7 +972,8 @@ def make_classic_force_plot(
 
     ax.text(
         base_prob,
-        y_top + 0.072,
+        y_top
+        + 0.072,
         f"{base_prob:.3f}",
         ha="center",
         va="bottom",
@@ -913,15 +981,14 @@ def make_classic_force_plot(
         color="#777777",
     )
 
-    # Explicit meaning:
-    # higher = higher POOR wound-healing probability
-    # lower  = lower POOR wound-healing probability
     center = (
-        final_prob + base_prob
+        final_prob
+        + base_prob
     ) / 2
 
     ax.text(
-        center - 0.025,
+        center
+        - 0.025,
         0.955,
         "higher",
         transform=ax.get_xaxis_transform(),
@@ -943,7 +1010,8 @@ def make_classic_force_plot(
     )
 
     ax.text(
-        center + 0.025,
+        center
+        + 0.025,
         0.955,
         "lower",
         transform=ax.get_xaxis_transform(),
@@ -966,6 +1034,7 @@ def make_classic_force_plot(
         pos_segments
         + neg_segments
     ):
+
         all_x.extend(
             [
                 item["x0"],
@@ -975,18 +1044,28 @@ def make_classic_force_plot(
 
     xmin = max(
         0.0,
-        min(all_x) - 0.08
+        min(
+            all_x
+        )
+        - 0.08
     )
 
     xmax = min(
         1.0,
-        max(all_x) + 0.08
+        max(
+            all_x
+        )
+        + 0.08
     )
 
-    if xmax - xmin < 0.35:
+    if (
+        xmax - xmin
+        < 0.35
+    ):
 
         mid = (
-            xmin + xmax
+            xmin
+            + xmax
         ) / 2
 
         xmin = max(
@@ -1011,7 +1090,9 @@ def make_classic_force_plot(
 
     ax.set_xticklabels(
         [
-            f"{x:.3f}".rstrip("0").rstrip(".")
+            f"{x:.3f}"
+            .rstrip("0")
+            .rstrip(".")
             for x in ticks
         ],
         fontsize=9,
@@ -1056,7 +1137,7 @@ def make_classic_force_plot(
 
 
 # ============================================================
-# 8. New-patient input
+# 8. Patient inputs
 # ============================================================
 
 st.sidebar.header(
@@ -1079,7 +1160,9 @@ for variable in PREDICTORS:
         variable
     )
 
-    if meta["type"] == "categorical":
+    if meta[
+        "type"
+    ] == "categorical":
 
         levels = [
             str(x)
@@ -1099,7 +1182,8 @@ for variable in PREDICTORS:
             levels.index(
                 default
             )
-            if default in levels
+            if default
+            in levels
             else 0
         )
 
@@ -1118,10 +1202,14 @@ for variable in PREDICTORS:
         ] = st.sidebar.number_input(
             label=label,
             value=float(
-                meta["default"]
+                meta[
+                    "default"
+                ]
             ),
             step=float(
-                meta["step"]
+                meta[
+                    "step"
+                ]
             ),
         )
 
@@ -1157,7 +1245,6 @@ if clicked:
         )
 
         st.stop()
-
 
     st.subheader(
         "Prediction Result"
